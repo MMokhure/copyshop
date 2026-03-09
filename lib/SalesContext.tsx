@@ -86,6 +86,15 @@ function todayDateKey() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+// Fire-and-forget DB sync — optimistic UI, background persistence
+function dbSync(method: 'POST' | 'PUT' | 'DELETE', url: string, body?: unknown) {
+  fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  }).catch((err) => console.warn('[DB sync failed]', method, url, err));
+}
+
 function lsGet<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
@@ -211,23 +220,25 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const [investments, setInvestments] = useState<Investment[]>([]);
   const [hydrated, setHydrated] = useState(false);
 
-  // Hydrate from localStorage once on the client
+  // Hydrate — localStorage first (fast), then DB (source of truth)
   useEffect(() => {
+    // Step 1: fast load from localStorage cache
     setExpenses(lsGet('cs_expenses', DEFAULT_EXPENSES));
     setDeposits(lsGet('cs_deposits', DEFAULT_DEPOSITS));
     setAccounts(lsGet('cs_accounts', DEFAULT_ACCOUNTS));
     setInventory(lsGet('cs_inventory', DEFAULT_INVENTORY));
     setPrinters(lsGet('cs_printers', DEFAULT_PRINTERS));
     setServices(lsGet('cs_services', DEFAULT_SERVICES));
-    setSalesHistory(lsGet('cs_sales_history', []));
+    const cachedHistory = lsGet<SaleEntry[]>('cs_sales_history', []);
+    setSalesHistory(cachedHistory);
     setTodayEntries(lsGet(`cs_tally_${todayDateKey()}`, []));
     setSettings(lsGet('cs_settings', DEFAULT_SETTINGS));
-    const csUsers = lsGet<AppUser[]>('cs_users', DEFAULT_USERS);
-    setUsers(csUsers);
+    setUsers(lsGet<AppUser[]>('cs_users', DEFAULT_USERS));
     const cuid = typeof window !== 'undefined' ? localStorage.getItem('cs_current_user_id') : null;
     setCurrentUserId(cuid);
     setInvestments(lsGet('cs_investments', DEFAULT_INVESTMENTS));
-    // Purge daily tally keys older than 7 days to prevent localStorage bloat
+
+    // Purge old tally keys
     if (typeof window !== 'undefined') {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - 7);
@@ -237,7 +248,43 @@ export function SalesProvider({ children }: { children: ReactNode }) {
         .forEach((k) => localStorage.removeItem(k));
     }
     setHydrated(true);
-  }, []);
+
+    // Step 2: async DB load — overrides localStorage with server data
+    async function loadFromDB() {
+      try {
+        const initRes = await fetch('/api/init');
+        if (!initRes.ok) return; // DB not reachable, keep localStorage data
+        const [expenses, deposits, accounts, inventory, printers, services, sales, settingsData, usersData, investments] = await Promise.all([
+          fetch('/api/expenses').then((r) => r.json()),
+          fetch('/api/deposits').then((r) => r.json()),
+          fetch('/api/accounts').then((r) => r.json()),
+          fetch('/api/inventory').then((r) => r.json()),
+          fetch('/api/printers').then((r) => r.json()),
+          fetch('/api/services').then((r) => r.json()),
+          fetch('/api/sales').then((r) => r.json()),
+          fetch('/api/settings').then((r) => r.json()),
+          fetch('/api/users').then((r) => r.json()),
+          fetch('/api/investments').then((r) => r.json()),
+        ]);
+        if (Array.isArray(expenses))   setExpenses(expenses);
+        if (Array.isArray(deposits))   setDeposits(deposits);
+        if (Array.isArray(accounts))   setAccounts(accounts);
+        if (Array.isArray(inventory))  setInventory(inventory);
+        if (Array.isArray(printers))   setPrinters(printers);
+        if (Array.isArray(services))   setServices(services);
+        if (Array.isArray(sales)) {
+          setSalesHistory(sales);
+          setTodayEntries(sales.filter((e: SaleEntry) => e.timestamp?.startsWith(todayDateKey())));
+        }
+        if (settingsData && settingsData.shopName) setSettings(settingsData);
+        if (Array.isArray(usersData) && usersData.length > 0) setUsers(usersData);
+        if (Array.isArray(investments)) setInvestments(investments);
+      } catch {
+        // DB unavailable — keep localStorage data already loaded
+      }
+    }
+    loadFromDB();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Persist on change (after hydration)
   useEffect(() => { if (hydrated) lsSet('cs_expenses', expenses); }, [expenses, hydrated]);
@@ -256,14 +303,17 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const addExpense = useCallback((e: Omit<Expense, 'id' | 'createdAt'>) => {
     const exp: Expense = { ...e, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setExpenses((prev) => [exp, ...prev]);
+    dbSync('POST', '/api/expenses', exp);
   }, []);
 
   const updateExpense = useCallback((id: string, patch: Partial<Expense>) => {
     setExpenses((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+    dbSync('PUT', `/api/expenses/${id}`, patch);
   }, []);
 
   const deleteExpense = useCallback((id: string) => {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
+    dbSync('DELETE', `/api/expenses/${id}`);
   }, []);
 
   const expensesTotal = expenses.reduce((s, e) => s + e.amount, 0);
@@ -272,14 +322,17 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const addDeposit = useCallback((d: Omit<Deposit, 'id' | 'createdAt'>) => {
     const dep: Deposit = { ...d, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setDeposits((prev) => [dep, ...prev]);
+    dbSync('POST', '/api/deposits', dep);
   }, []);
 
   const updateDeposit = useCallback((id: string, patch: Partial<Deposit>) => {
     setDeposits((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
+    dbSync('PUT', `/api/deposits/${id}`, patch);
   }, []);
 
   const deleteDeposit = useCallback((id: string) => {
     setDeposits((prev) => prev.filter((d) => d.id !== id));
+    dbSync('DELETE', `/api/deposits/${id}`);
   }, []);
 
   const depositsTotal = deposits.reduce((s, d) => s + d.amount, 0);
@@ -288,28 +341,34 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const addAccount = useCallback((a: Omit<CopyShopAccount, 'id' | 'createdAt'>) => {
     const acc: CopyShopAccount = { ...a, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setAccounts((prev) => [...prev, acc]);
+    dbSync('POST', '/api/accounts', acc);
   }, []);
 
   const updateAccount = useCallback((id: string, patch: Partial<CopyShopAccount>) => {
     setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, ...patch } : a)));
+    dbSync('PUT', `/api/accounts/${id}`, patch);
   }, []);
 
   const deleteAccount = useCallback((id: string) => {
     setAccounts((prev) => prev.filter((a) => a.id !== id));
+    dbSync('DELETE', `/api/accounts/${id}`);
   }, []);
 
   // ── Inventory CRUD ───────────────────────────────────────────────────────────
   const addInventoryItem = useCallback((item: Omit<InventoryItem, 'id' | 'addedAt'>) => {
     const newItem: InventoryItem = { ...item, id: crypto.randomUUID(), addedAt: new Date().toISOString() };
     setInventory((prev) => [...prev, newItem]);
+    dbSync('POST', '/api/inventory', newItem);
   }, []);
 
   const updateInventoryItem = useCallback((id: string, patch: Partial<InventoryItem>) => {
     setInventory((prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+    dbSync('PUT', `/api/inventory/${id}`, patch);
   }, []);
 
   const deleteInventoryItem = useCallback((id: string) => {
     setInventory((prev) => prev.filter((i) => i.id !== id));
+    dbSync('DELETE', `/api/inventory/${id}`);
   }, []);
 
   const lowStockCount = inventory.filter((i) => i.quantity <= i.minQuantity).length;
@@ -318,33 +377,38 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const addPrinter = useCallback((p: Omit<Printer, 'id' | 'addedAt'>) => {
     const printer: Printer = { ...p, id: crypto.randomUUID(), addedAt: new Date().toISOString() };
     setPrinters((prev) => [...prev, printer]);
+    dbSync('POST', '/api/printers', printer);
   }, []);
 
   const updatePrinter = useCallback((id: string, patch: Partial<Printer>) => {
     setPrinters((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+    dbSync('PUT', `/api/printers/${id}`, patch);
   }, []);
 
   const deletePrinter = useCallback((id: string) => {
     setPrinters((prev) => prev.filter((p) => p.id !== id));
+    dbSync('DELETE', `/api/printers/${id}`);
   }, []);
 
   // ── Service CRUD ────────────────────────────────────────────────────────────
   const addService = useCallback((s: Omit<Service, 'id' | 'createdAt'>) => {
     const svc: Service = { ...s, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setServices((prev) => [...prev, svc]);
+    dbSync('POST', '/api/services', svc);
   }, []);
 
   const updateService = useCallback((id: string, patch: Partial<Service>) => {
     setServices((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+    dbSync('PUT', `/api/services/${id}`, patch);
   }, []);
 
   const deleteService = useCallback((id: string) => {
     setServices((prev) => prev.filter((s) => s.id !== id));
+    dbSync('DELETE', `/api/services/${id}`);
   }, []);
 
   // ── Tally ───────────────────────────────────────────────────────────────────
   const addSale = useCallback((serviceId: string) => {
-    // Read from ref — avoids calling setState inside another setState updater
     const svc = servicesRef.current.find((s) => s.id === serviceId);
     if (!svc) return;
     const entry: SaleEntry = {
@@ -357,11 +421,13 @@ export function SalesProvider({ children }: { children: ReactNode }) {
     };
     setTodayEntries((prev) => [...prev, entry]);
     setSalesHistory((prev) => [...prev, entry]);
+    dbSync('POST', '/api/sales', entry);
   }, []);
 
   const cancelSale = useCallback((id: string) => {
     setTodayEntries((prev) => prev.filter((e) => e.id !== id));
     setSalesHistory((prev) => prev.filter((e) => e.id !== id));
+    dbSync('DELETE', `/api/sales/${id}`);
   }, []);
 
   const undoLastSale = useCallback(() => {
@@ -369,11 +435,18 @@ export function SalesProvider({ children }: { children: ReactNode }) {
       if (prev.length === 0) return prev;
       const removed = prev[prev.length - 1];
       setSalesHistory((h) => h.filter((e) => e.id !== removed.id));
+      dbSync('DELETE', `/api/sales/${removed.id}`);
       return prev.slice(0, -1);
     });
   }, []);
 
-  const clearToday = useCallback(() => setTodayEntries([]), []);
+  const clearToday = useCallback(() => {
+    setTodayEntries((prev) => {
+      prev.forEach((e) => dbSync('DELETE', `/api/sales/${e.id}`));
+      return [];
+    });
+    setSalesHistory((prev) => prev.filter((e) => !e.timestamp?.startsWith(todayDateKey())));
+  }, []);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
   const todayTotal = todayEntries.reduce((sum, e) => sum + e.price, 0);
@@ -384,22 +457,31 @@ export function SalesProvider({ children }: { children: ReactNode }) {
     [todayEntries]
   );
 
+  // Settings ref so updateSettings can pass merged value to DB
+  const settingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
   const updateSettings = useCallback((patch: Partial<AppSettings>) => {
-    setSettings((prev) => ({ ...prev, ...patch }));
+    const next = { ...settingsRef.current, ...patch };
+    setSettings(next);
+    dbSync('PUT', '/api/settings', next);
   }, []);
 
   // ── User CRUD ────────────────────────────────────────────────────────────────
   const addUser = useCallback((u: Omit<AppUser, 'id' | 'createdAt'>) => {
     const user: AppUser = { ...u, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setUsers((prev) => [...prev, user]);
+    dbSync('POST', '/api/users', user);
   }, []);
 
   const updateUser = useCallback((id: string, patch: Partial<AppUser>) => {
     setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, ...patch } : u)));
+    dbSync('PUT', `/api/users/${id}`, patch);
   }, []);
 
   const deleteUser = useCallback((id: string) => {
     setUsers((prev) => prev.filter((u) => u.id !== id));
+    dbSync('DELETE', `/api/users/${id}`);
   }, []);
 
   const loginUser = useCallback((id: string, pin: string): boolean => {
@@ -424,16 +506,19 @@ export function SalesProvider({ children }: { children: ReactNode }) {
     if (entry.timestamp.slice(0, 10) === today) {
       setTodayEntries((prev) => [...prev, newEntry]);
     }
+    dbSync('POST', '/api/sales', newEntry);
   }, []);
 
   const updateSaleEntry = useCallback((id: string, patch: Partial<SaleEntry>) => {
     setSalesHistory((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
     setTodayEntries((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+    dbSync('PUT', `/api/sales/${id}`, patch);
   }, []);
 
   const deleteSaleEntry = useCallback((id: string) => {
     setSalesHistory((prev) => prev.filter((e) => e.id !== id));
     setTodayEntries((prev) => prev.filter((e) => e.id !== id));
+    dbSync('DELETE', `/api/sales/${id}`);
   }, []);
 
   const currentUser = users.find((u) => u.id === currentUserId) ?? null;
@@ -442,14 +527,17 @@ export function SalesProvider({ children }: { children: ReactNode }) {
   const addInvestment = useCallback((inv: Omit<Investment, 'id' | 'createdAt'>) => {
     const item: Investment = { ...inv, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setInvestments((prev) => [item, ...prev]);
+    dbSync('POST', '/api/investments', item);
   }, []);
 
   const updateInvestment = useCallback((id: string, patch: Partial<Investment>) => {
     setInvestments((prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+    dbSync('PUT', `/api/investments/${id}`, patch);
   }, []);
 
   const deleteInvestment = useCallback((id: string) => {
     setInvestments((prev) => prev.filter((i) => i.id !== id));
+    dbSync('DELETE', `/api/investments/${id}`);
   }, []);
 
   const investmentsTotal = investments.reduce((s, i) => s + i.value * i.quantity, 0);

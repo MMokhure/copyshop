@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 
 export async function GET() {
-  // Shows which DB env vars are present (values hidden for security)
   const vars = [
     'DATABASE_URL',
     'DATABASE_URL_UNPOOLED',
@@ -11,21 +10,26 @@ export async function GET() {
     'POSTGRES_HOST',
     'NEON_PROJECT_ID',
   ];
-  const present: Record<string, boolean> = {};
+
+  const envInfo: Record<string, string> = {};
   for (const v of vars) {
-    present[v] = !!process.env[v];
+    const val = process.env[v];
+    if (val) {
+      envInfo[v] = val.slice(0, 30) + '…'; // show partial value for diagnosis
+    } else {
+      envInfo[v] = '(not set)';
+    }
   }
 
-  // Try a simple DB query
   let dbStatus = 'not tested';
   try {
-    const { getDb } = await import('@/lib/db');
-    const db = getDb();
-    await db`SELECT 1`;
-    dbStatus = 'connected';
+    const { sql } = await import('@/lib/db');
+    await sql`SELECT 1 as ok`;
+    dbStatus = 'CONNECTED OK';
   } catch (err) {
     dbStatus = String(err);
   }
 
-  return NextResponse.json({ envVars: present, dbStatus });
+  return NextResponse.json({ envInfo, dbStatus });
 }
+
